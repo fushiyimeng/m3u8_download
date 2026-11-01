@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
+import queue
 import random
 import re
 import shutil
@@ -519,6 +521,7 @@ class Downloader:
         self.total = 0
         self.done_bytes = 0
         self.t0 = time.time()
+        self.on_progress = None      # 服务模式用来上报进度
 
     # ---------- 基础请求 ----------
     def _get(self, url: str, stream: bool = False, headers: Optional[dict] = None):
@@ -694,6 +697,11 @@ class Downloader:
         sys.stdout.write(f"\r  [{bar}] {pct:5.1f}%  {self.done}/{self.total}  "
                          f"{_fmt_size(self.done_bytes)}  {_fmt_size(speed)}/s   ")
         sys.stdout.flush()
+        if self.on_progress:
+            try:
+                self.on_progress(self.done, self.total)
+            except Exception:
+                pass
 
     # ---------- 合并 ----------
     def _find_ffmpeg(self) -> Optional[str]:
@@ -749,6 +757,242 @@ class Downloader:
         return True
 
 
+# ────────────────────────────── 本地服务（给浏览器扩展用）─────────────────────────────
+# 浏览器扩展嗅探到 m3u8 后，POST 一个任务过来，这里用同一套下载核心在后台干活。
+# 只监听 127.0.0.1，并且只放行来自浏览器扩展（Origin: chrome-extension://）的请求，
+# 网页脚本即使扫到端口也没法往里塞任务。
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_settings.json")
+
+_tasks: dict[str, dict] = {}
+_task_order: list[str] = []
+_task_lock = threading.Lock()
+_task_q: "queue.Queue[str | None]" = queue.Queue()
+
+
+def _load_settings() -> dict:
+    try:
+        return json.load(open(SETTINGS_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_settings(d: dict) -> None:
+    try:
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception:
+        pass
+
+
+def _task_view(t: dict) -> dict:
+    get = t.get
+    total = int(get("total") or 0)
+    done = int(get("done") or 0)
+    return {
+        "id": get("id"),
+        "url": get("url"),
+        "title": get("title"),
+        "status": get("status"),
+        "done": done,
+        "total": total,
+        "percent": round(done / total * 100, 1) if total else 0,
+        "out": get("out"),
+        "error": get("error", ""),
+        "created": get("created"),
+    }
+
+
+def _task_update(tid: str, **kw) -> None:
+    with _task_lock:
+        t = _tasks.get(tid)
+        if t:
+            t.update(kw)
+
+
+def _enqueue(payload: dict) -> str:
+    import uuid
+    tid = uuid.uuid4().hex[:10]
+    with _task_lock:
+        _tasks[tid] = {
+            "id": tid,
+            "url": str(payload.get("url") or ""),
+            "title": str(payload.get("title") or ""),
+            "referer": str(payload.get("referer") or ""),
+            "cookie": str(payload.get("cookie") or ""),
+            "status": "queued",
+            "done": 0,
+            "total": 0,
+            "out": "",
+            "error": "",
+            "created": time.time(),
+        }
+        _task_order.append(tid)
+    _task_q.put(tid)
+    return tid
+
+
+def _worker(base_args) -> None:
+    import copy
+    while True:
+        tid = _task_q.get()
+        if tid is None:
+            return
+        with _task_lock:
+            t = dict(_tasks.get(tid) or {})
+        try:
+            settings = _load_settings()
+            save_dir = settings.get("save_dir") or base_args.save_dir or os.path.join(
+                os.path.expanduser("~"), "Downloads")
+            cache_dir = settings.get("cache_dir") or base_args.cache_dir or ""
+            os.makedirs(save_dir, exist_ok=True)
+
+            a = copy.deepcopy(base_args)
+            a.save_dir = save_dir
+            a.cache_dir = cache_dir
+            a.referer = t.get("referer") or base_args.referer
+            a.cookie = t.get("cookie") or base_args.cookie
+            a.keep_temp = False
+            a.output = ""
+
+            d = Downloader(a)
+            d.on_progress = lambda done, total: _task_update(tid, done=done, total=total,
+                                                             status="downloading")
+
+            name = _safe_name(t.get("title") or "", name_from_target(t.get("url") or "video"))
+            out = build_output_path(save_dir, name)
+            parts_dir = ((os.path.join(cache_dir, name + ".parts")) if cache_dir
+                         else (out + ".parts"))
+
+            _task_update(tid, status="downloading", out=out)
+            pl, base = d.load_playlist(t["url"])
+            rc = d.run(t["url"], out, parts_dir=parts_dir, playlist=pl, base_url=base)
+            if rc == 0:
+                _task_update(tid, status="done", out=out)
+            else:
+                _task_update(tid, status="failed", error="下载器返回 %d" % rc)
+        except Exception as e:  # noqa: BLE001
+            _task_update(tid, status="failed", error=str(e)[:300])
+        finally:
+            _task_q.task_done()
+
+
+def _json_bytes(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+def serve(host: str, port: int, base_args, workers: int = 2) -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    for _ in range(max(1, workers)):
+        threading.Thread(target=_worker, args=(base_args,), daemon=True).start()
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "m3u8-local/1.0"
+
+        def log_message(self, fmt, *args):
+            if base_args.verbose:
+                sys.stderr.write("[serve] " + (fmt % args) + "\n")
+
+        def _origin(self) -> str:
+            return str(self.headers.get("Origin") or "")
+
+        def _origin_ok(self, write: bool) -> bool:
+            o = self._origin()
+            if not o:
+                return True                       # curl / 本地脚本
+            if o.startswith("chrome-extension://") or o.startswith("extension://"):
+                return True
+            return False                          # 网页一律拒绝
+
+        def _send(self, code: int, obj) -> None:
+            body = _json_bytes(obj)
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            o = self._origin()
+            if o and (o.startswith("chrome-extension://") or o.startswith("extension://")):
+                self.send_header("Access-Control-Allow-Origin", o)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            o = self._origin()
+            if o and (o.startswith("chrome-extension://") or o.startswith("extension://")):
+                self.send_header("Access-Control-Allow-Origin", o)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+
+        def do_GET(self):
+            if not self._origin_ok(False):
+                return self._send(403, {"ok": False, "error": "只允许浏览器扩���调用"})
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path == "/api/ping":
+                s = _load_settings()
+                return self._send(200, {"ok": True, "name": "m3u8-local", "version": 1,
+                                        "save_dir": s.get("save_dir") or base_args.save_dir,
+                                        "cache_dir": s.get("cache_dir") or ""})
+            if path == "/api/tasks":
+                with _task_lock:
+                    items = [_task_view(_tasks[i]) for i in reversed(_task_order[-50:])]
+                return self._send(200, {"ok": True, "tasks": items})
+            if path.startswith("/api/tasks/"):
+                tid = path.rsplit("/", 1)[-1]
+                with _task_lock:
+                    t = _tasks.get(tid)
+                if not t:
+                    return self._send(404, {"ok": False, "error": "没有这个任务"})
+                return self._send(200, {"ok": True, "task": _task_view(t)})
+            if path == "/api/config":
+                s = _load_settings()
+                return self._send(200, {"ok": True,
+                                        "save_dir": s.get("save_dir") or base_args.save_dir,
+                                        "cache_dir": s.get("cache_dir") or ""})
+            return self._send(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            if not self._origin_ok(True):
+                return self._send(403, {"ok": False, "error": "只允许浏览器扩展调用"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception as e:  # noqa: BLE001
+                return self._send(400, {"ok": False, "error": "JSON 解析失败: %s" % e})
+
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path == "/api/download":
+                url = str(payload.get("url") or "").strip()
+                if not re.match(r"^https?://", url, re.I):
+                    return self._send(400, {"ok": False, "error": "url 不合法"})
+                tid = _enqueue(payload)
+                return self._send(200, {"ok": True, "id": tid})
+            if path == "/api/config":
+                s = _load_settings()
+                if "save_dir" in payload:
+                    s["save_dir"] = str(payload["save_dir"] or "")
+                if "cache_dir" in payload:
+                    s["cache_dir"] = str(payload["cache_dir"] or "")
+                _save_settings(s)
+                return self._send(200, {"ok": True, **s})
+            return self._send(404, {"ok": False, "error": "not found"})
+
+    httpd = ThreadingHTTPServer((host, int(port)), Handler)
+    print(f"→ 本地接收服务已启动：http://{host}:{port}/api/ping")
+    print("  浏览器扩展里填这个地址；Ctrl+C 退出")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
+    finally:
+        httpd.server_close()
+
+
 # ────────────────────────────── 命令行 ──────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -788,6 +1032,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--click", action="append", default=[],
                    help="额外要点击的 CSS 选择器，可重复（比如播放按钮不标准时）")
     p.add_argument("--selftest", action="store_true", help="跑一遍内置 AES 自检后退出")
+    p.add_argument("--serve", nargs="?", const="127.0.0.1:18888", default=None,
+                   metavar="HOST:PORT",
+                   help="启动本地接收服务，给浏览器扩展发任务用（默认 127.0.0.1:18888）")
+    p.add_argument("--serve-workers", type=int, default=2,
+                   help="本地服务同时下载几个任务（默认 2）")
     return p
 
 
@@ -825,6 +1074,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         _selftest_aes()
         print("AES 自检通过")
         return 0
+    if args.serve:
+        host, _, port = str(args.serve).rpartition(":")
+        if not host:
+            host, port = "127.0.0.1", args.serve
+        args.target = args.target or "."          # serve 模式不需要 target
+        serve(host or "127.0.0.1", int(port or 18888), args, workers=args.serve_workers)
+        return 0
+
     if not args.target:
         build_parser().error("缺少地址（网页或 m3u8 都行；或用 --selftest 只跑自检）")
     _selftest_aes()

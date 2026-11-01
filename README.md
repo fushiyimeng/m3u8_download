@@ -6,12 +6,23 @@
 > 只能处理本地 m3u8 + 本地 key，遇到网络地址就抓瞎。2026 年按 HLS 规范重写了核心，
 > 界面换成 Qt（窗口仍是原来的 800x600），旧脚本收进 legacy/ 留作存档。
 
-## 两个入口
+## 三个入口
 
 | 文件 | 用途 |
 |---|---|
 | m3u8_download.py | 命令行版，适合脚本 / 批量 |
 | m3u8_gui.py | Qt 图形界面（PyQt5），双击或 pythonw 启动 |
+| extension/ | **浏览器扩展**（Edge/Chrome 开发者模式加载）：播放页面时自动抓 m3u8，一键交给本地下载 |
+
+## 浏览器扩展怎么用
+
+1. 双击 `启动扩展后端.bat`（本地接收服务 127.0.0.1:18888，窗口保持开着）
+2. Edge 打开 `edge://extensions/` → 打开「开发人员模式」→「加载解压缩的扩展」→ 选 extension 文件夹
+3. 打开要下载的页面，**播放一下视频**；扩展图标上出现数字 = 抓到媒体
+4. 点扩展图标 → 选一条点「下载」，或「全部交给下载器」；也可以网页右键菜单
+
+扩展只做两件事：观察媒体请求、把地址 POST 给本地服务。**不注入网页、不读 cookie、没有远程脚本**，
+下载/解密/合并全在本地 Python 里（AES-128、ffmpeg、断点续传）。
 
 ## 两种给法
 
@@ -121,6 +132,22 @@
 - 失败重试（指数退避）+ 403 提示补 Referer/Cookie
 - 有 ffmpeg 用无损 copy 合并，没有就二进制拼接
 - 不支持 SAMPLE-AES（DRM），会明确报错
+
+## 本地服务（--serve）
+
+扩展需要它：
+
+    python m3u8_download.py --serve 127.0.0.1:18888
+
+接口：
+
+    GET  /api/ping             健康检查 + 当前保存目录
+    GET  /api/tasks            任务列表（状态 / 进度 / 输出路径）
+    GET  /api/tasks/<id>       单个任务
+    POST /api/download         {url, title?, referer?, cookie?} → {id}
+    GET/POST /api/config       保存目录、缓存目录
+
+只监听 127.0.0.1，只接受 `Origin: chrome-extension://…` 的请求，网页脚本扫到端口也塞不进任务。
 
 ## 常见问题
 

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>设置 · 本地 m3u8 下载器</title>
+<style>
+body { font: 14px/1.7 system-ui, 'Microsoft YaHei', sans-serif; margin: 24px; max-width: 720px; color: #1f2328; }
+h2 { font-size: 16px; }
+label { display: block; margin: 14px 0 4px; color: #57606a; font-size: 13px; }
+input { width: 100%; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; font: inherit; }
+button { margin-top: 12px; padding: 6px 14px; border: 1px solid #d0d7de; background: #fff; border-radius: 6px; cursor: pointer; font: inherit; }
+button.primary { background: #2f6fed; color: #fff; border-color: #2f6fed; }
+#msg { margin-top: 14px; font-size: 13px; }
+.ok { color: #1a7f37; } .err { color: #cf222e; }
+.tip { background: #f6f8fa; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; font-size: 13px; color: #57606a; margin-top: 18px; }
+code { background: #eef1f4; padding: 1px 4px; border-radius: 4px; }
+</style></head>
+<body>
+<h2>本地 m3u8 下载器 · 设置</h2>
+
+<label>本地服务地址</label>
+<input id="server" placeholder="http://127.0.0.1:18888">
+
+<label>保存目录（由本地服务决定）</label>
+<input id="saveDir" placeholder="留空 = 用户「下载」文件夹">
+
+<label>缓存目录（分片临时文件）</label>
+<input id="cacheDir" placeholder="留空 = 放在保存目录下的「视频名.parts」">
+
+<button class="primary" id="save">保存</button>
+<button id="test">测试连接</button>
+<div id="msg"></div>
+
+<div class="tip">
+<b>怎么用：</b><br>
+1. 双击本目录里的 <code>启动扩展后端.bat</code>（保持窗口开着）<br>
+2. 在要下载的页面播放一下视频，扩展图标上会出现数字<br>
+3. 点扩展图标，选想下的那一条，点「下载」<br>
+4. 文件会落在上面这个「保存目录」里（文件名用网页标题）
+</div>
+
+<script src="options.js"></script>
+</body></html>

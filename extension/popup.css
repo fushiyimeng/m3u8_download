@@ -1,0 +1,27 @@
+* { box-sizing: border-box; }
+body { font: 13px/1.5 system-ui, 'Microsoft YaHei', sans-serif; margin: 0; width: 400px; color: #1f2328; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: #f6f8fa; border-bottom: 1px solid #e5e7eb; }
+.brand { font-weight: 600; }
+.tools button, .bar button { font: inherit; padding: 3px 9px; border: 1px solid #d0d7de; background: #fff; border-radius: 6px; cursor: pointer; }
+.tools button:hover, .bar button:hover { background: #f3f4f6; }
+.bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+.bar .primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+.bar .primary:hover { background: #255fd6; }
+.hint { color: #6b7280; font-size: 12px; }
+.page { padding: 6px 10px; color: #57606a; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list { max-height: 320px; overflow-y: auto; padding: 0 6px 6px; }
+.item { display: flex; align-items: center; gap: 8px; padding: 6px; border-radius: 6px; }
+.item:hover { background: #f6f8fa; }
+.badge { flex: none; width: 40px; text-align: center; font-size: 11px; color: #fff; border-radius: 4px; padding: 1px 0; }
+.badge.hls { background: #7c3aed; }
+.badge.video { background: #2f6fed; }
+.badge.audio { background: #059669; }
+.meta { flex: 1; min-width: 0; }
+.name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub { color: #8b949e; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.send { flex: none; font: inherit; padding: 2px 8px; border: 1px solid #d0d7de; background: #fff; border-radius: 6px; cursor: pointer; }
+.empty { padding: 16px 10px; color: #8b949e; text-align: center; }
+.status { padding: 6px 10px; border-top: 1px solid #e5e7eb; background: #f6f8fa; color: #57606a; font-size: 12px; }
+.status.ok { color: #1a7f37; }
+.status.warn { color: #b45309; }
+.status.err { color: #cf222e; }

@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "本地 m3u8 下载器助手",
+  "version": "1.0.0",
+  "description": "嗅探网页里的 m3u8 / 视频 / 音频，一键交给本地 m3u8 下载器（AES 解密 + ffmpeg 合并）",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "webRequest",
+    "tabs",
+    "storage",
+    "contextMenus",
+    "notifications"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:18888/*",
+    "http://localhost:18888/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "本地 m3u8 下载器助手"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

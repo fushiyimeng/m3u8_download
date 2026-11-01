@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+<title>本地 m3u8 下载器</title>
+</head>
+<body>
+<header>
+  <div class="brand">本地 m3u8 下载器</div>
+  <div class="tools">
+    <button id="btnSettings" title="设置">设置</button>
+    <button id="btnClear" title="清空本页记录">清空</button>
+  </div>
+</header>
+<div id="pageTitle" class="page">…</div>
+<div class="bar">
+  <button id="btnAll" class="primary">全部交给下载器</button>
+  <span id="hint" class="hint"></span>
+</div>
+<div id="list" class="list"></div>
+<footer id="status" class="status">未连接本地服务</footer>
+<script src="popup.js"></script>
+</body>
+</html>
