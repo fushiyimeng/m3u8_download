@@ -90,6 +90,33 @@ function render(items) {
 }
 
 let pollTimer = null;
+let grabTimer = null;
+
+async function fallbackLocal(hls, tabInfo) {
+  const r2 = await chrome.runtime.sendMessage({ type: 'download', items: hls, tab: tabInfo });
+  if (r2 && r2.ok) { setStatus('已改用本地下载器…'); startPolling(); }
+  else { setStatus('本地下载也失败了', 'err'); }
+}
+
+function startGrabPolling(gid, hls, tabInfo) {
+  if (grabTimer) clearInterval(grabTimer);
+  grabTimer = setInterval(async function () {
+    const r = await chrome.runtime.sendMessage({ type: 'grabstatus', gid: gid });
+    const j = (r && r.job) || {};
+    if (j.status === 'done') {
+      clearInterval(grabTimer); grabTimer = null;
+      setStatus('完成：' + (j.out || j.dir || ''), 'ok');
+    } else if (j.status === 'failed') {
+      clearInterval(grabTimer); grabTimer = null;
+      setStatus('浏览器抓取失败（' + (j.error || '') + '），改用本地下载…', 'warn');
+      fallbackLocal(hls, tabInfo);
+    } else if (j.status === 'merging') {
+      setStatus('分片抓完，正在合并…');
+    } else {
+      setStatus('浏览器抓取中 ' + (j.done || 0) + '/' + (j.total || '?'));
+    }
+  }, 700);
+}
 
 function startPolling() {
   if (pollTimer) return;
@@ -123,7 +150,16 @@ async function sendItems(items, btn) {
     r = await chrome.runtime.sendMessage({ type: 'browserdownload', items: direct, tab: tabInfo });
     if (r && r.ok) setStatus('已交给浏览器下载（可在下载列表看进度）', 'ok');
   }
-  if (hls.length) {                          // m3u8：交给本地下载器（要合并、解密）
+  if (hls.length) {                          // m3u8：先让浏览器自己抓分片（带 cookie，过防盗链）
+    const g = await chrome.runtime.sendMessage({
+      type: 'grab', url: hls[0].url, title: tabInfo ? tabInfo.title : '', tabId: tab ? tab.id : -1
+    });
+    if (g && g.ok) {
+      setStatus('浏览器开始抓取分片…');
+      startGrabPolling(g.gid, hls, tabInfo);
+      if (btn) { btn.disabled = false; btn.textContent = '下载'; }
+      return;
+    }
     const r2 = await chrome.runtime.sendMessage({ type: 'download', items: hls, tab: tabInfo });
     if (r2 && r2.ok) { r = r2; setStatus('已发送到本地下载器，开始下载…'); startPolling(); }
   }

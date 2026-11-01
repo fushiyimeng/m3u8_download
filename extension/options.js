@@ -20,6 +20,9 @@ async function loadConfig() {
     if (j.ok) {
       document.getElementById('saveDir').value = j.save_dir || '';
       document.getElementById('cacheDir').value = j.cache_dir || '';
+      if (j.ffmpeg && !document.getElementById('ffmpeg').value) {
+        document.getElementById('ffmpeg').value = j.ffmpeg;
+      }
     }
   } catch (e) {
     msg('连不上本地服务（先启动 启动扩展后端.bat）', 'err');
@@ -39,7 +42,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           save_dir: document.getElementById('saveDir').value.trim(),
-          cache_dir: document.getElementById('cacheDir').value.trim()
+          cache_dir: document.getElementById('cacheDir').value.trim(),
+          ffmpeg: document.getElementById('ffmpeg').value.trim()
         })
       });
       const j = await r.json();

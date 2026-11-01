@@ -757,6 +757,151 @@ class Downloader:
         return True
 
 
+# ────────────────────────────── 浏览器抓取 → 本地合并 ──────────────────────────────
+# 扩展在页面上下文 fetch 分片（天然带 cookie/Referer，过防盗链），
+# 分片二进制按序 POST 过来，本地拼成 ts，再用 ffmpeg 转 mp4。
+
+_grabs: dict[str, dict] = {}
+_grab_lock = threading.Lock()
+
+
+def _grab_dir() -> str:
+    s = _load_settings()
+    d = s.get("cache_dir") or s.get("save_dir") or os.path.join(
+        os.path.expanduser("~"), "Downloads")
+    d = os.path.join(d, ".grab_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _grab_view(g: dict) -> dict:
+    return {
+        "id": g.get("id"),
+        "title": g.get("title"),
+        "status": g.get("status"),
+        "received": g.get("received", 0),
+        "total": g.get("total", 0),
+        "out": g.get("out", ""),
+        "error": g.get("error", ""),
+    }
+
+
+def _find_ffmpeg() -> str:
+    """依次找：设置里的路径 → PATH → 同目录 → 常见工具目录。"""
+    s = _load_settings()
+    p = str(s.get("ffmpeg") or "")
+    if p and os.path.exists(p):
+        return p
+    w = shutil.which("ffmpeg")
+    if w:
+        return w
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (
+        os.path.join(here, "ffmpeg.exe"),
+        os.path.join(here, "bin", "ffmpeg.exe"),
+        "D:/tools/let-ai-read-video/tools/ffmpeg.exe",
+        "C:/ffmpeg/bin/ffmpeg.exe",
+    ):
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _merge_ts_dir(src_dir: str, title: str) -> dict:
+    """把扩展用浏览器下载下来的分片按文件名排序拼起来，ffmpeg 转 mp4。"""
+    if not os.path.isdir(src_dir):
+        return {"ok": False, "error": "分片目录不存在：%s" % src_dir}
+    files = [f for f in os.listdir(src_dir) if f.lower().endswith((".ts", ".m4s", ".mp4", ".aac"))]
+    files.sort()
+    if not files:
+        return {"ok": False, "error": "分片目录是空的"}
+    save_dir = _load_settings().get("save_dir") or os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(save_dir, exist_ok=True)
+    name = _safe_name(title or "", "video")
+    out = build_output_path(save_dir, name)
+
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        list_file = os.path.join(src_dir, "_concat.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for fn in files:
+                p = os.path.abspath(os.path.join(src_dir, fn)).replace("\\", "/")
+                f.write("file '%s'\n" % p.replace("'", "'\\''"))
+        import subprocess
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy"]
+        if all(fn.lower().endswith(".ts") for fn in files):
+            cmd += ["-bsf:a", "aac_adtstoasc"]
+        cmd.append(out)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            shutil.rmtree(src_dir, ignore_errors=True)
+            return {"ok": True, "out": out}
+        # ffmpeg 不行就直接拼 ts
+        ts_out = os.path.splitext(out)[0] + ".ts"
+        with open(ts_out, "wb") as w:
+            for fn in files:
+                with open(os.path.join(src_dir, fn), "rb") as f:
+                    shutil.copyfileobj(f, w)
+        shutil.rmtree(src_dir, ignore_errors=True)
+        return {"ok": True, "out": ts_out, "note": "ffmpeg 失败，已直接拼成 .ts"}
+    ts_out = os.path.splitext(out)[0] + ".ts"
+    with open(ts_out, "wb") as w:
+        for fn in files:
+            with open(os.path.join(src_dir, fn), "rb") as f:
+                shutil.copyfileobj(f, w)
+    shutil.rmtree(src_dir, ignore_errors=True)
+    return {"ok": True, "out": ts_out, "note": "没装 ffmpeg，已拼成 .ts"}
+
+
+def _grab_finish(gid: str) -> dict:
+    g = _grabs.get(gid)
+    if not g:
+        return {"ok": False, "error": "没有这个任务"}
+    ts_path = g["ts_path"]
+    if not os.path.exists(ts_path) or os.path.getsize(ts_path) == 0:
+        g["status"] = "failed"
+        g["error"] = "没有收到任何分片"
+        return {"ok": False, "error": g["error"]}
+
+    save_dir = _load_settings().get("save_dir") or os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(save_dir, exist_ok=True)
+    name = _safe_name(g.get("title") or "", "video")
+    out = build_output_path(save_dir, name)
+
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        import subprocess
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", ts_path, "-c", "copy", "-bsf:a", "aac_adtstoasc", out]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+            # 转封装失败就把 ts 直接留下来，别让用户一无所获
+            ts_out = os.path.splitext(out)[0] + ".ts"
+            try:
+                os.replace(ts_path, ts_out)
+            except Exception:
+                shutil.copy2(ts_path, ts_out)
+            g.update({"status": "done", "out": ts_out,
+                      "error": "ffmpeg 转封装失败，已保留 .ts：%s" % r.stderr.strip()[:120]})
+            return {"ok": True, "out": ts_out, "note": g["error"]}
+    else:
+        ts_out = os.path.splitext(out)[0] + ".ts"
+        try:
+            os.replace(ts_path, ts_out)
+        except Exception:
+            shutil.copy2(ts_path, ts_out)
+        g.update({"status": "done", "out": ts_out, "error": "没装 ffmpeg，已保存 .ts"})
+        return {"ok": True, "out": ts_out, "note": "没装 ffmpeg，已保存 .ts"}
+
+    try:
+        os.remove(ts_path)
+    except Exception:
+        pass
+    g.update({"status": "done", "out": out, "error": ""})
+    return {"ok": True, "out": out}
+
+
 # ────────────────────────────── 本地服务（给浏览器扩展用）─────────────────────────────
 # 浏览器扩展嗅探到 m3u8 后，POST 一个任务过来，这里用同一套下载核心在后台干活。
 # 只监听 127.0.0.1，并且只放行来自浏览器扩展（Origin: chrome-extension://）的请求，
@@ -959,6 +1104,13 @@ def serve(host: str, port: int, base_args, workers: int = 2) -> None:
                 if not t:
                     return self._send(404, {"ok": False, "error": "没有这个任务"})
                 return self._send(200, {"ok": True, "task": _task_view(t)})
+            if path.startswith("/api/grab/"):
+                gid = path.rsplit("/", 1)[-1]
+                with _grab_lock:
+                    g = _grabs.get(gid)
+                if not g:
+                    return self._send(404, {"ok": False, "error": "没有这个任务"})
+                return self._send(200, {"ok": True, "task": _grab_view(g)})
             if path == "/api/config":
                 s = _load_settings()
                 return self._send(200, {"ok": True,
@@ -969,13 +1121,62 @@ def serve(host: str, port: int, base_args, workers: int = 2) -> None:
         def do_POST(self):
             if not self._origin_ok(True):
                 return self._send(403, {"ok": False, "error": "只允许浏览器扩展调用"})
+
+            import urllib.parse as _up
+            path = _up.urlparse(self.path).path.rstrip("/") or "/"
+            query = _up.parse_qs(_up.urlparse(self.path).query)
+            n = int(self.headers.get("Content-Length") or 0)
+
+            # 分片二进制（浏览器抓下来的 ts 片段）
+            if path.startswith("/api/grab/") and path.endswith("/chunk"):
+                try:
+                    gid = path.split("/")[-2]
+                    seq = int((query.get("seq") or ["0"])[0])
+                except Exception:
+                    return self._send(400, {"ok": False, "error": "参数错误"})
+                data = self.rfile.read(n) if n else b""
+                with _grab_lock:
+                    g = _grabs.get(gid)
+                    if not g:
+                        return self._send(404, {"ok": False, "error": "任务不存在"})
+                    try:
+                        with open(g["ts_path"], "ab") as f:
+                            f.write(data)
+                    except Exception as e:  # noqa: BLE001
+                        return self._send(500, {"ok": False, "error": "写文件失败: %s" % e})
+                    g["received"] = int(g.get("received") or 0) + 1
+                    g["last_seq"] = seq
+                return self._send(200, {"ok": True, "received": g["received"]})
+
             try:
-                n = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
             except Exception as e:  # noqa: BLE001
                 return self._send(400, {"ok": False, "error": "JSON 解析失败: %s" % e})
 
-            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path == "/api/grab/new":
+                import uuid
+                gid = str(payload.get("id") or uuid.uuid4().hex[:10])
+                ts_path = os.path.join(_grab_dir(), gid + ".ts")
+                open(ts_path, "wb").close()
+                with _grab_lock:
+                    _grabs[gid] = {"id": gid, "title": str(payload.get("title") or ""),
+                                   "ts_path": ts_path, "status": "grabbing",
+                                   "received": 0, "total": int(payload.get("total") or 0),
+                                   "out": "", "error": ""}
+                return self._send(200, {"ok": True, "id": gid})
+
+            if path == "/api/grab/merge":
+                src = str(payload.get("dir") or "").strip()
+                if not src or not os.path.isdir(src):
+                    return self._send(400, {"ok": False, "error": "dir 不存在：%s" % src})
+                r = _merge_ts_dir(src, str(payload.get("title") or ""))
+                return self._send(200 if r.get("ok") else 500, r)
+
+            if path.startswith("/api/grab/") and path.endswith("/finish"):
+                gid = path.split("/")[-2]
+                r = _grab_finish(gid)
+                return self._send(200 if r.get("ok") else 500, r)
+
             if path == "/api/download":
                 url = str(payload.get("url") or "").strip()
                 if not re.match(r"^https?://", url, re.I):
@@ -988,6 +1189,8 @@ def serve(host: str, port: int, base_args, workers: int = 2) -> None:
                     s["save_dir"] = str(payload["save_dir"] or "")
                 if "cache_dir" in payload:
                     s["cache_dir"] = str(payload["cache_dir"] or "")
+                if "ffmpeg" in payload:
+                    s["ffmpeg"] = str(payload["ffmpeg"] or "")
                 _save_settings(s)
                 return self._send(200, {"ok": True, **s})
             return self._send(404, {"ok": False, "error": "not found"})

@@ -180,6 +180,200 @@ async function browserDownload(items, tab) {
   return { ok: results.some(function (r) { return r.ok; }), results: results };
 }
 
+// ── 浏览器自己下分片（带 cookie/Referer，过防盗链；本地只负责合并）──
+let grabJobs = {};
+
+function absUrl(u, base) {
+  try { return new URL(u, base).href; } catch (e) { return u; }
+}
+
+async function fetchPlaylistText(url) {
+  const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
+  if (!r.ok) throw new Error('m3u8 HTTP ' + r.status);
+  return await r.text();
+}
+
+async function resolveSegments(url, depth) {
+  depth = depth || 0;
+  const text = await fetchPlaylistText(url);
+  const lines = text.split(/\r?\n/);
+
+  // master playlist：挑带宽最大的子清单
+  let bw = 0;
+  const variants = [];
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (s.startsWith('#EXT-X-STREAM-INF:')) {
+      const m = /BANDWIDTH=(\d+)/i.exec(s);
+      bw = m ? Number(m[1]) : 1;
+    } else if (s && s.charAt(0) !== '#' && bw > 0) {
+      variants.push({ url: absUrl(s, url), bw: bw });
+      bw = 0;
+    }
+  }
+  if (variants.length && depth < 3) {
+    variants.sort(function (a, b) { return b.bw - a.bw; });
+    return await resolveSegments(variants[0].url, depth + 1);
+  }
+
+  if (text.indexOf('#EXT-X-KEY') >= 0 && text.indexOf('METHOD=NONE') < 0) {
+    throw new Error('这条流是加密的（AES-128），浏览器抓取模式暂不支持，请用本地下载模式');
+  }
+  const segs = [];
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (!s || s.charAt(0) === '#') continue;
+    segs.push(absUrl(s, url));
+  }
+  if (!segs.length) throw new Error('m3u8 里没找到分片');
+  return segs;
+}
+
+function downloadOne(url, filename) {
+  return new Promise(function (resolve, reject) {
+    chrome.downloads.download({
+      url: url, filename: filename, conflictAction: 'overwrite', saveAs: false
+    }, function (id) {
+      if (chrome.runtime.lastError || !id) {
+        return reject(new Error((chrome.runtime.lastError && chrome.runtime.lastError.message) || 'download 调用失败'));
+      }
+      // 用轮询而不是只靠 onChanged：本地文件下载极快，事件可能在监听前就结束了
+      let settled = false;
+      const finish = function (ok, val) {
+        if (settled) return;
+        settled = true;
+        if (ok) resolve(val); else reject(val);
+      };
+      const check = function () {
+        chrome.downloads.search({ id: id }, function (items) {
+          const it = items && items[0];
+          if (!it) {
+            return finish(false, new Error('下载记录消失了'));
+          }
+          if (it.state === 'complete') return finish(true, it);
+          if (it.state === 'interrupted') return finish(false, new Error('下载中断：' + (it.error || '')));
+          if (!settled) setTimeout(check, 120);
+        });
+      };
+      setTimeout(check, 80);
+    });
+  });
+}
+
+function startGrab(m3u8Url, title, tabId) {
+  const gid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  grabJobs[gid] = { gid: gid, title: title || '', status: 'preparing', done: 0, total: 0,
+                    dir: '', out: '', error: '' };
+  runGrab(gid, m3u8Url, title).catch(function (e) {
+    const j = grabJobs[gid] || {};
+    j.status = 'failed';
+    j.error = String(e && e.message ? e.message : e);
+  });
+  return gid;
+}
+
+async function finishGrab(gid, title) {
+  const job = grabJobs[gid];
+  job.status = 'merging';
+  const server = await getServer();
+  const resp = await fetch(server + '/api/grab/' + gid + '/finish', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+  });
+  const j = await resp.json();
+  if (j.ok) {
+    job.status = 'done';
+    job.out = j.out || '';
+    job.error = j.note || '';
+  } else {
+    job.status = 'failed';
+    job.error = j.error || '合并失败';
+  }
+}
+
+async function runGrab(gid, m3u8Url, title) {
+  const job = grabJobs[gid];
+  try {
+    const segs = await resolveSegments(m3u8Url, 0);
+    job.total = segs.length;
+    job.status = 'downloading';
+    const server = await getServer();
+
+    // 路线 1：在页面/扩展里 fetch 分片，流式 POST 给本地（同源或 CDN 允许跨域时最快）
+    try {
+      const created = await fetch(server + '/api/grab/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: gid, title: title || '', total: segs.length })
+      });
+      const cj = await created.json();
+      if (!cj.ok) throw new Error('建任务失败：' + (cj.error || ''));
+      for (let i = 0; i < segs.length; i++) {
+        const r = await fetch(segs[i], { credentials: 'include' });
+        if (!r.ok) throw new Error('分片 HTTP ' + r.status);
+        const buf = await r.arrayBuffer();
+        const up = await fetch(server + '/api/grab/' + gid + '/chunk?seq=' + i, {
+          method: 'POST', body: buf
+        });
+        if (!up.ok) throw new Error('上传失败 ' + up.status);
+        job.done = i + 1;
+      }
+      await finishGrab(gid, title);
+      return;
+    } catch (e) {
+      job.lastError = 'fetch 方式不可用（' + String(e && e.message ? e.message : e) + '），改用浏览器下载';
+      job.done = 0;
+    }
+
+    // 路线 2：让浏览器自己下载分片（chrome.downloads，带 cookie、不受 CORS 限制）
+    const prefix = 'm3u8grab/' + gid + '/';
+    let next = 0, running = 0, firstFile = '';
+    await new Promise(function (resolve) {
+      function pump() {
+        while (running < 8 && next < segs.length) {
+          const idx = next++;
+          running++;
+          const filename = prefix + String(idx).padStart(6, '0') + '.ts';
+          downloadOne(segs[idx], filename).then(function (item) {
+            if (item && item.filename) firstFile = item.filename;
+            job.done++;
+            running--;
+            if (next >= segs.length && running === 0) resolve();
+            else pump();
+          }).catch(function (err) {
+            job.done++;
+            job.lastError = String(err && err.message ? err.message : err);
+            running--;
+            if (next >= segs.length && running === 0) resolve();
+            else pump();
+          });
+        }
+        if (next >= segs.length && running === 0) resolve();
+      }
+      pump();
+    });
+
+    if (!firstFile) throw new Error('浏览器下载也没拿到分片：' + (job.lastError || ''));
+    job.dir = firstFile.replace(/[\\/][^\\/]+$/, '');
+    job.status = 'merging';
+    const resp = await fetch(server + '/api/grab/merge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dir: job.dir, title: title || '' })
+    });
+    const j = await resp.json();
+    if (j.ok) {
+      job.status = 'done';
+      job.out = j.out || '';
+    } else {
+      job.status = 'failed';
+      job.error = j.error || '合并失败';
+    }
+  } catch (e) {
+    job.status = 'failed';
+    job.error = String(e && e.message ? e.message : e);
+  }
+}
+
 async function getTasks() {
   const server = await getServer();
   try {
@@ -235,6 +429,11 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       sendResponse(await sendAll(msg.items || [], msg.tab || null));
     } else if (msg.type === 'browserdownload') {
       sendResponse(await browserDownload(msg.items || [], msg.tab || null));
+    } else if (msg.type === 'grab') {
+      sendResponse({ ok: true, gid: startGrab(msg.url, msg.title, msg.tabId) });
+    } else if (msg.type === 'grabstatus') {
+      const j = grabJobs[msg.gid] || {};
+      sendResponse({ ok: true, job: j });
     } else if (msg.type === 'tasks') {
       sendResponse(await getTasks());
     } else if (msg.type === 'ping') {

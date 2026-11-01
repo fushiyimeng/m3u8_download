@@ -25,6 +25,9 @@ code { background: #eef1f4; padding: 1px 4px; border-radius: 4px; }
 <label>缓存目录（分片临时文件）</label>
 <input id="cacheDir" placeholder="留空 = 放在保存目录下的「视频名.parts」">
 
+<label>ffmpeg 路径（合并成 mp4 用，留空自动找）</label>
+<input id="ffmpeg" placeholder="例如 D:\tools\let-ai-read-video\tools\ffmpeg.exe">
+
 <button class="primary" id="save">保存</button>
 <button id="test">测试连接</button>
 <div id="msg"></div>
