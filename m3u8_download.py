@@ -822,6 +822,7 @@ def _enqueue(payload: dict) -> str:
             "title": str(payload.get("title") or ""),
             "referer": str(payload.get("referer") or ""),
             "cookie": str(payload.get("cookie") or ""),
+            "headers": payload.get("headers") if isinstance(payload.get("headers"), dict) else {},
             "status": "queued",
             "done": 0,
             "total": 0,
@@ -858,6 +859,15 @@ def _worker(base_args) -> None:
             a.output = ""
 
             d = Downloader(a)
+            # 浏览器捕获到的请求头（防盗链站点必需：Cookie / Referer / Origin / UA）
+            hdrs = t.get("headers") or {}
+            if getattr(base_args, "verbose", False):
+                print("[serve] 任务 %s 请求头: %s" % (tid, {k: str(v)[:40] for k, v in hdrs.items()}))
+            for k, v in (hdrs.items() if isinstance(hdrs, dict) else []):
+                if k in ("Cookie", "Referer", "Origin", "User-Agent", "Accept", "Accept-Language") and v:
+                    d.session.headers[str(k)] = str(v)
+            if t.get("referer"):
+                d.session.headers["Referer"] = str(t["referer"])
             d.on_progress = lambda done, total: _task_update(tid, done=done, total=total,
                                                              status="downloading")
 
@@ -982,7 +992,31 @@ def serve(host: str, port: int, base_args, workers: int = 2) -> None:
                 return self._send(200, {"ok": True, **s})
             return self._send(404, {"ok": False, "error": "not found"})
 
-    httpd = ThreadingHTTPServer((host, int(port)), Handler)
+    # Windows 上 SO_REUSEADDR 会让第二个进程也能绑上同一端口（很坑），先主动探一下
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        if probe.connect_ex((host, int(port))) == 0:
+            print(f"启动失败：{host}:{port} 已经有人在监听了（多半是上次的窗口没关）。")
+            print("  去任务管理器结束旧的 python 进程，或者换个端口：")
+            print(f"    python m3u8_download.py --serve {host}:{int(port) + 1}")
+            print("    （记得扩展「设置」里的地址也要跟着改）")
+            return
+    finally:
+        probe.close()
+
+    class _Server(ThreadingHTTPServer):
+        allow_reuse_address = False      # 端口被占就直接报错，不要悄悄绑上
+        allow_reuse_port = False
+
+    try:
+        httpd = _Server((host, int(port)), Handler)
+    except OSError as e:
+        print(f"启动失败：{host}:{port} 已经被占用（{e}）。")
+        print("  多半是上次的「启动扩展后端」窗口还开着，去任务管理器结束旧 python 进程，")
+        print("  或者换个端口：--serve 127.0.0.1:18889（扩展设置里地址也要改）")
+        return
     print(f"→ 本地接收服务已启动：http://{host}:{port}/api/ping")
     print("  浏览器扩展里填这个地址；Ctrl+C 退出")
     try:

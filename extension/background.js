@@ -10,7 +10,8 @@ const SKIP_RE = /^(blob:|data:|ws:|wss:)/i;
 const SEGMENT_RE = /\.(ts|m4s)(\?|#|$)/i;   // 分片不记，交给 m3u8 去解析
 const MAX_PER_TAB = 120;
 
-let captures = null;   // { tabId: [ {url, kind, size, ct, ts} ] }
+let captures = null;   // { tabId: [ {url, kind, size, ct, ts, headers} ] }
+let reqHeaders = {};   // url -> { Cookie, Referer, Origin, 'User-Agent' }（防盗链站点必需）
 
 async function load() {
   if (captures) return captures;
@@ -59,6 +60,7 @@ async function addCapture(tabId, url, ct, size) {
   const list = caps[tabId] || (caps[tabId] = []);
   const i = list.findIndex(function (x) { return x.url === url; });
   const item = { url: url, kind: kind, size: size || 0, ct: ct || '', ts: Date.now() };
+  if (reqHeaders[url]) item.headers = reqHeaders[url];
   if (i >= 0) {
     list[i] = item;
   } else {
@@ -90,6 +92,29 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders']
 );
 
+// 观察请求头：把浏览器真正发出去的 Cookie/Referer/Origin/UA 记下来，
+// 发任务时一起交给本地下载器（否则防盗链站点会把 Python 的请求直接 RST）
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  function (d) {
+    if (d.tabId < 0 || !d.url) return;
+    const h = {};
+    for (const x of (d.requestHeaders || [])) {
+      const k = String(x.name || '').toLowerCase();
+      if (k === 'cookie') h.Cookie = String(x.value || '');
+      else if (k === 'referer') h.Referer = String(x.value || '');
+      else if (k === 'origin') h.Origin = String(x.value || '');
+      else if (k === 'user-agent') h['User-Agent'] = String(x.value || '');
+    }
+    if (Object.keys(h).length) {
+      reqHeaders[d.url] = h;
+      const keys = Object.keys(reqHeaders);
+      if (keys.length > 500) { for (const old of keys.slice(0, 100)) delete reqHeaders[old]; }
+    }
+  },
+  { urls: ['<all_urls>'] },
+  ['requestHeaders']
+);
+
 chrome.tabs.onRemoved.addListener(async function (tabId) {
   const caps = await load();
   if (caps[tabId]) { delete caps[tabId]; await save(); }
@@ -118,10 +143,36 @@ async function sendAll(items, tab) {
         body: JSON.stringify({
           url: it.url,
           title: (tab && tab.title) || '',
-          referer: (tab && tab.url) || ''
+          referer: (tab && tab.url) || '',
+          headers: it.headers || reqHeaders[it.url] || {}
         })
       });
       results.push(await resp.json());
+    } catch (e) {
+      results.push({ ok: false, error: String(e) });
+    }
+  }
+  return { ok: results.some(function (r) { return r.ok; }), results: results };
+}
+
+// 单文件（mp4/mp3…）：直接交给浏览器下载，走它自己的 cookie 和缓存，不经过本地服务
+async function browserDownload(items, tab) {
+  const results = [];
+  for (const it of items) {
+    try {
+      let name = '';
+      try {
+        name = decodeURIComponent(new URL(it.url).pathname.split('/').pop() || '');
+      } catch (e) { name = ''; }
+      const t = (tab && tab.title) ? tab.title.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80) : '';
+      const ext = name.indexOf('.') >= 0 ? name.slice(name.lastIndexOf('.')) : '';
+      const id = await chrome.downloads.download({
+        url: it.url,
+        filename: (t || 'download') + ext,
+        conflictAction: 'uniquify',
+        saveAs: false
+      });
+      results.push({ ok: true, id: id });
     } catch (e) {
       results.push({ ok: false, error: String(e) });
     }
@@ -182,6 +233,8 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       sendResponse({ ok: true });
     } else if (msg.type === 'download') {
       sendResponse(await sendAll(msg.items || [], msg.tab || null));
+    } else if (msg.type === 'browserdownload') {
+      sendResponse(await browserDownload(msg.items || [], msg.tab || null));
     } else if (msg.type === 'tasks') {
       sendResponse(await getTasks());
     } else if (msg.type === 'ping') {

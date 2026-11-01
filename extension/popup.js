@@ -112,16 +112,25 @@ function startPolling() {
 
 async function sendItems(items, btn) {
   const tab = await currentTab();
+  const tabInfo = tab ? { title: tab.title, url: tab.url } : null;
+  const hls = items.filter(function (it) { return it.kind === 'hls'; });
+  const direct = items.filter(function (it) { return it.kind !== 'hls'; });
+
   if (btn) { btn.disabled = true; btn.textContent = '发送中…'; }
-  const r = await chrome.runtime.sendMessage({
-    type: 'download',
-    items: items,
-    tab: tab ? { title: tab.title, url: tab.url } : null
-  });
+
+  let r = null;
+  if (direct.length) {                       // mp4/mp3：浏览器自己下（带 cookie、能用缓存）
+    r = await chrome.runtime.sendMessage({ type: 'browserdownload', items: direct, tab: tabInfo });
+    if (r && r.ok) setStatus('已交给浏览器下载（可在下载列表看进度）', 'ok');
+  }
+  if (hls.length) {                          // m3u8：交给本地下载器（要合并、解密）
+    const r2 = await chrome.runtime.sendMessage({ type: 'download', items: hls, tab: tabInfo });
+    if (r2 && r2.ok) { r = r2; setStatus('已发送到本地下载器，开始下载…'); startPolling(); }
+  }
+
   if (btn) { btn.disabled = false; btn.textContent = '下载'; }
   if (r && r.ok) {
-    setStatus('已发送，开始下载…');
-    startPolling();
+    if (hls.length) startPolling();
   } else {
     const err = (r && r.results && r.results[0] && r.results[0].error) || (r && r.error) || '发送失败';
     setStatus('发送失败：' + err, 'err');
