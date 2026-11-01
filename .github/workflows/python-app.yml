@@ -24,9 +24,9 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install flake8 pytest
+        pip install flake8
 
-    - name: Lint
+    - name: Lint（配置见 .flake8，legacy/ 不参与）
       run: |
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 

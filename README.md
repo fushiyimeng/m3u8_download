@@ -4,23 +4,27 @@
 
 > 2021 年那版是 pygame 手搓的 GUI，靠「第 7 行、奇数行」猜格式，硬编码 Z:/mp4，
 > 只能处理本地 m3u8 + 本地 key，遇到网络地址就抓瞎。2026 年按 HLS 规范重写了核心，
-> 旧脚本收进 legacy/ 留作存档。
+> 界面换成 Qt（窗口仍是原来的 800x600），旧脚本收进 legacy/ 留作存档。
 
 ## 两个入口
 
 | 文件 | 用途 |
 |---|---|
 | m3u8_download.py | 命令行版，适合脚本 / 批量 |
-| m3u8_gui.pyw | 图形界面，双击就能用（tkinter，无额外依赖） |
+| m3u8_gui.py | Qt 图形界面（PyQt5），双击或 pythonw 启动 |
 
 ## 装依赖
 
     pip install requests
 
+图形界面还需要 Qt 绑定（只装一次）：
+
+    pip install -r requirements-gui.txt
+
 合并建议装 ffmpeg（可选，不装也能拼，但装了解密/封装更稳）：
 
 - 把 ffmpeg.exe 放到脚本同目录，或加进 PATH
-- 也可以用 --ffmpeg "D:\tools\ffmpeg.exe" 指定
+- 也可以用 --ffmpeg "D:\\tools\\ffmpeg.exe" 指定
 
 > AES-128 解密是内置的纯 Python 实现，不需要装 cryptography / pycryptodome。
 
@@ -30,7 +34,7 @@
     python m3u8_download.py "https://example.com/video/index.m3u8"
 
     # 指定输出文件
-    python m3u8_download.py "https://example.com/video/index.m3u8" -o "D:\视频\第01集.mp4"
+    python m3u8_download.py "https://example.com/video/index.m3u8" -o "D:\\视频\\第01集.mp4"
 
     # 防盗链站点：带上 Referer / Cookie / UA
     python m3u8_download.py "https://..." --referer "https://example.com/" --cookie "token=abc; uid=123"
@@ -69,16 +73,19 @@
     --verbose               打印更多过程
     --selftest              跑 AES 自检
 
-## 图形界面
+## 图形界面（Qt）
 
-双击 m3u8_gui.pyw（或 pythonw m3u8_gui.pyw）：
+    python m3u8_gui.py          # 带控制台
+    pythonw m3u8_gui.py         # 不带控制台（双击也行）
+
+窗口大小保持原版 pygame 界面的 800x600。用法：
 
 1. 粘贴 m3u8 地址（或点「本地文件…」选一个）
 2. 选保存位置（不填就自动放在当前目录）
-3. 需要防盗链的站点，展开「可选」填 Referer / Cookie
+3. 需要防盗链的站点，填 Referer / Cookie
 4. 点「开始下载」，进度条和日志会实时更新
 
-界面只负责收集参数，真正干活的是命令行版（子进程），所以两边行为完全一致；
+界面只负责收集参数，真正干活的是命令行版（QProcess 子进程），所以两边行为完全一致；
 按「停止」会保留已下载的分片，下次重跑接着下。
 
 ## 支持的 HLS 特性
@@ -113,10 +120,15 @@ ffmpeg -i "https://.../index.m3u8" -c copy out.ts
 装 ffmpeg 再跑一次；或加 --keep-temp 保留分片，手动：
 ffmpeg -f concat -safe 0 -i out.mp4.parts/concat.txt -c copy out.mp4
 
+**Qt 界面起不来**
+
+先装 PyQt5：pip install -r requirements-gui.txt。没有图形界面也能用命令行版。
+
 ## 开发 / 测试
 
     python tests/test_m3u8.py      # 本地 file:// 清单 + AES 往返，不联网
     python m3u8_download.py --selftest
+    python -m flake8 .             # 配置见 .flake8（legacy/ 不参与）
 
 ## 说明
 
