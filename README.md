@@ -13,13 +13,22 @@
 | m3u8_download.py | 命令行版，适合脚本 / 批量 |
 | m3u8_gui.py | Qt 图形界面（PyQt5），双击或 pythonw 启动 |
 
+## 两种给法
+
+1. **直接给 m3u8 地址**（或者本地 .m3u8 文件）—— 老办法，直接下。
+2. **只给网页地址** —— 程序会用无头浏览器打开页面、自动等播放、抓出 m3u8 再下。
+   文件名默认用**网页标题**（获取到什么就叫什么），也可以自己指定。
+
 ## 装依赖
 
     pip install requests
 
-图形界面还需要 Qt 绑定（只装一次）：
+图形界面 + 网页自动解析：
 
     pip install -r requirements-gui.txt
+
+> 自动解析用 **系统自带的 Edge**（playwright channel=msedge），**不用下载浏览器内核**。
+> 没有 Edge 的话会自动回退到 playwright 自带内核（那时才需要 playwright install chromium）。
 
 合并建议装 ffmpeg（可选，不装也能拼，但装了解密/封装更稳）：
 
@@ -30,14 +39,23 @@
 
 ## 命令行用法
 
-    # 最简单：给个地址，自动挑最高码率、自动合并
+    # 网页地址：自动找 m3u8，名字用网页标题
+    python m3u8_download.py "https://example.com/video/12345.html"
+
+    # m3u8 直链：直接下
     python m3u8_download.py "https://example.com/video/index.m3u8"
 
-    # 指定输出文件
-    python m3u8_download.py "https://example.com/video/index.m3u8" -o "D:\\视频\\第01集.mp4"
+    # 指定保存目录 / 缓存目录
+    python m3u8_download.py "https://..." --save-dir "D:\\视频" --cache-dir "D:\\缓存"
 
     # 防盗链站点：带上 Referer / Cookie / UA
     python m3u8_download.py "https://..." --referer "https://example.com/" --cookie "token=abc; uid=123"
+
+    # 页面要手动点播放：加一个点击选择器 + 多等一会
+    python m3u8_download.py "https://..." --click ".my-play-btn" --wait 40
+
+    # 页面卡住排查：把浏览器显示出来看
+    python m3u8_download.py "https://..." --no-headless --wait 60
 
     # 加速 / 多试几次
     python m3u8_download.py "https://..." --workers 16 --retries 5
@@ -48,15 +66,19 @@
     # 看 master playlist 有哪些清晰度
     python m3u8_download.py "https://..." --list-formats
 
-    # 下载第 2 个变体（0 = 最高码率）
-    python m3u8_download.py "https://..." --bandwidth-index 1
-
     # 跑一下内置自检（验证 AES 实现没坏）
     python m3u8_download.py --selftest
 
 ### 全部参数
 
-    -o, --output            输出文件（默认按 m3u8 名字生成 .mp4）
+    -o, --output            输出文件名（默认自动：网页标题 / m3u8 名）
+    --save-dir              保存目录（默认当前目录）
+    --cache-dir             分片缓存目录（默认放保存目录下）
+    --no-browser            网页地址不自动解析，只当 m3u8 用
+    --browser               自动解析用哪个浏览器：msedge / chrome / chromium
+    --no-headless           显示浏览器窗口（排查用）
+    --wait                  最多等多少秒让页面出 m3u8（默认 25）
+    --click                 额外要点击的 CSS 选择器，可重复
     --referer               Referer
     --cookie                Cookie
     --user-agent            User-Agent
@@ -78,18 +100,18 @@
     python m3u8_gui.py          # 带控制台
     pythonw m3u8_gui.py         # 不带控制台（双击也行）
 
-窗口大小保持原版 pygame 界面的 800x600。用法：
+窗口 800x600（和原版一致）。主界面只有三行：
 
-1. 粘贴 m3u8 地址（或点「本地文件…」选一个）
-2. 选保存位置（不填就自动放在当前目录）
-3. 需要防盗链的站点，填 Referer / Cookie
-4. 点「开始下载」，进度条和日志会实时更新
+1. **地址**：网页地址或 m3u8 直链都行（网页会自动找 m3u8）
+2. **保存名**：留空 = 自动用网页标题
+3. **设置…**：保存目录 / 缓存目录 / 浏览器 / 等待时间 / 并发 / 重试 / ffmpeg
 
-界面只负责收集参数，真正干活的是命令行版（QProcess 子进程），所以两边行为完全一致；
-按「停止」会保留已下载的分片，下次重跑接着下。
+设置保存在系统里（QSettings），下次打开还记得。
+「打开保存目录」直接跳到下载好的地方。
 
 ## 支持的 HLS 特性
 
+- 网页自动解析：无头浏览器抓 m3u8（自动点播放按钮、滚动、等加载）
 - 普通媒体清单 + master playlist（自动选最高码率）
 - 相对路径 / 绝对路径 / 本地 file://
 - AES-128 加密（EXT-X-KEY，自动下载密钥；没给 IV 时按媒体序列号推导）
@@ -102,9 +124,18 @@
 
 ## 常见问题
 
+**网页打开了但没抓到 m3u8**
+
+页面可能要登录 / 要手动点播放 / 懒加载很慢。依次试：
+
+    --wait 60 --no-headless          # 看着浏览器，找它卡在哪
+    --click ".play-button"           # 自己指播放按钮
+    --cookie "你的登录 cookie"        # 需要登录的站
+
 **下载 403 / 401**
 
 站点做了防盗链。抓包看浏览器带了什么 Referer / Cookie，用 --referer / --cookie 补上。
+（用网页自动解析时，浏览器里的 cookie 会自动带给下载器，一般不用手动补。）
 
 **m3u8 是 master playlist，下成了低清晰度**
 

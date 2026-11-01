@@ -311,6 +311,160 @@ def parse_playlist(text: str, base_url: str) -> Playlist:
     return pl
 
 
+# ────────────────────────────── 网页自动解析 ──────────────────────────────
+# 给一个普通网页地址，用无头浏览器打开、自动等播放、抓 m3u8。
+# 浏览器用系统自带的 Edge（playwright channel=msedge），不用额外下内核。
+
+PLAY_SELECTORS = [
+    ".vjs-big-play-button",
+    ".play-button",
+    ".plyr__control--overlaid",
+    "button[aria-label*='播放']",
+    "button[aria-label*='Play' i]",
+    "[class*='play'][role='button']",
+    "[class*='player'] video",
+    "video",
+]
+
+
+def _safe_name(title: str, fallback: str) -> str:
+    """把网页标题变成安全的文件名。"""
+    t = re.sub(r"[\r\n\t]+", " ", title or "").strip()
+    t = re.sub(r'[\\/:*?"<>|]+', "_", t)
+    t = re.sub(r"\s+", " ", t).strip(" .")
+    return (t[:80].strip(" .") or fallback)
+
+
+def resolve_media_urls(page_url: str, *, browser: str = "msedge", headless: bool = True,
+                       wait: float = 25.0, user_agent: str = "", extra_clicks=None,
+                       verbose: bool = False):
+    """无头浏览器打开网页，自动捕获 m3u8。
+
+    返回 (候选地址列表, 网页标题, 额外请求头)
+    捕获不到会抛 RuntimeError。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("需要 playwright：pip install playwright（浏览器用系统 Edge，不用另下内核）")
+
+    found: list[str] = []
+
+    def on_response(resp):
+        try:
+            u = resp.url
+            ct = str((resp.headers or {}).get("content-type", "")).lower()
+            if ".m3u8" in u.lower() or "mpegurl" in ct:
+                if u not in found:
+                    found.append(u)
+        except Exception:
+            pass
+
+    with sync_playwright() as pw:
+        try:
+            if browser and browser.lower() not in ("chromium", "none", "default"):
+                browser_obj = pw.chromium.launch(channel=browser, headless=headless)
+            else:
+                browser_obj = pw.chromium.launch(headless=headless)
+        except Exception as e:
+            if browser and browser.lower() not in ("chromium", "none", "default"):
+                if verbose:
+                    print(f"  用 {browser} 启动失败（{str(e)[:80]}），改用自带内核")
+                browser_obj = pw.chromium.launch(headless=headless)
+            else:
+                raise
+
+        ctx = browser_obj.new_context(user_agent=user_agent or DEFAULT_UA)
+        page = ctx.new_page()
+        page.on("response", on_response)
+
+        if verbose:
+            print(f"  打开网页：{page_url}")
+        try:
+            page.goto(page_url, wait_until="domcontentloaded",
+                      timeout=max(15000, int(wait * 1000)))
+        except Exception as e:
+            if verbose:
+                print(f"  页面加载告警：{str(e)[:100]}")
+
+        title = ""
+        try:
+            title = page.title() or ""
+        except Exception:
+            pass
+
+        selectors = list(PLAY_SELECTORS) + list(extra_clicks or [])
+        clicked = set()
+        deadline = time.time() + max(5.0, wait)
+        while time.time() < deadline and not found:
+            for sel in selectors:
+                if sel in clicked:
+                    continue
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        clicked.add(sel)
+                        el.click(force=True, timeout=1500)
+                        if verbose:
+                            print(f"  已点击：{sel}")
+                except Exception:
+                    pass
+            try:
+                page.mouse.wheel(0, 900)
+            except Exception:
+                pass
+            page.wait_for_timeout(600)
+
+        for _ in range(20):          # 再给 6 秒收尾
+            if found:
+                break
+            page.wait_for_timeout(300)
+
+        headers = {}
+        try:
+            cookies = [f"{c['name']}={c['value']}" for c in ctx.cookies()]
+            if cookies:
+                headers["Cookie"] = "; ".join(cookies)
+        except Exception:
+            pass
+        try:
+            title = page.title() or title
+        except Exception:
+            pass
+
+        try:
+            browser_obj.close()
+        except Exception:
+            pass
+
+    if not found:
+        raise RuntimeError("浏览器打开了页面，但没捕获到 m3u8（可能要先登录、或手动点播放；"
+                           "可以试 --wait 40 或 --no-headless 看看到底卡在哪）")
+    return found, title.strip(), headers
+
+
+def pick_playlist(candidates: list[str], headers: dict, args) -> tuple[Playlist, str]:
+    """在捕获到的候选里挑一个真能用的（优先 master / 分片多的）。"""
+    dl = Downloader(args)
+    if headers:
+        dl.session.headers.update(headers)
+    errors = []
+    best = None
+    for u in candidates:
+        try:
+            pl, base = dl.load_playlist(u)
+            if pl.is_master:
+                return pl, base
+            if pl.segments:
+                if best is None or len(pl.segments) > len(best[0].segments):
+                    best = (pl, base)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{u} -> {str(e)[:80]}")
+    if best:
+        return best
+    raise RuntimeError("捕获到的 m3u8 都打不开：\n  " + "\n  ".join(errors[:5]))
+
+
 # ────────────────────────────── 下载 ──────────────────────────────
 class _LocalResp:
     """file:// 地址的假响应对象，让本地 m3u8 / 本地 ts 也能走同一套流程。"""
@@ -470,8 +624,12 @@ class Downloader:
         return len(raw)
 
     # ---------- 主流程 ----------
-    def run(self, target: str, out: str) -> int:
-        pl, base = self.load_playlist(target)
+    def run(self, target: str, out: str, parts_dir: str | None = None,
+            playlist: Playlist | None = None, base_url: str | None = None) -> int:
+        if playlist is not None:
+            pl, base = playlist, (base_url or target)
+        else:
+            pl, base = self.load_playlist(target)
         pl, base = self.choose_variant(base, pl)
         segs = [s for s in pl.segments]
         if not segs:
@@ -479,7 +637,7 @@ class Downloader:
         print(f"→ 共 {len(segs)} 个分片"
               + ("（含 init 段）" if any(s.is_init for s in segs) else ""))
 
-        parts_dir = out + ".parts"
+        parts_dir = parts_dir or (out + ".parts")
         os.makedirs(parts_dir, exist_ok=True)
         self.fetch_keys(segs)
         self.total = len(segs)
@@ -617,23 +775,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="只解析、不下载")
     p.add_argument("--list-formats", action="store_true", help="列出 master playlist 的变体")
     p.add_argument("--verbose", "-v", action="store_true", help="打印更多过程")
+    p.add_argument("--save-dir", default="", help="保存目录（默认当前目录）")
+    p.add_argument("--cache-dir", default="", help="分片缓存目录（默认放在保存目录下）")
+    p.add_argument("--no-browser", action="store_true",
+                   help="网页地址不自动解析，只当 m3u8 用")
+    p.add_argument("--browser", default="msedge",
+                   help="自动解析用哪个浏览器：msedge / chrome / chromium（默认 msedge，用系统自带的）")
+    p.add_argument("--no-headless", action="store_true",
+                   help="显示浏览器窗口（页面卡住时用这个看看到底发生了什么）")
+    p.add_argument("--wait", type=float, default=25.0,
+                   help="最多等多少秒让页面把 m3u8 吐出来（默认 25）")
+    p.add_argument("--click", action="append", default=[],
+                   help="额外要点击的 CSS 选择器，可重复（比如播放按钮不标准时）")
     p.add_argument("--selftest", action="store_true", help="跑一遍内置 AES 自检后退出")
     return p
 
 
-def default_output(target: str, base: str) -> str:
+def name_from_target(target: str) -> str:
+    """从地址/文件名里取一个名字（网页标题拿不到时的兜底）。"""
     if re.match(r"^https?://", target, re.I):
         name = os.path.basename(urllib.parse.urlparse(target).path) or "video.m3u8"
     else:
         name = os.path.basename(target)
     stem, _ = os.path.splitext(name)
-    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem) or "video"
-    out = stem + ".mp4"
+    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem).strip(" .")
+    return stem or "video"
+
+
+def build_output_path(save_dir: str, name: str, ext: str = ".mp4") -> str:
+    """在保存目录里生成不冲突的文件名。"""
+    out = os.path.join(save_dir, name + ext)
     if os.path.exists(out):
         i = 2
-        while os.path.exists(f"{stem}_{i}.mp4"):
+        while os.path.exists(os.path.join(save_dir, f"{name}_{i}{ext}")):
             i += 1
-        out = f"{stem}_{i}.mp4"
+        out = os.path.join(save_dir, f"{name}_{i}{ext}")
     return out
 
 
@@ -650,12 +826,50 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("AES 自检通过")
         return 0
     if not args.target:
-        build_parser().error("缺少 m3u8 地址（或用 --selftest 只跑自检）")
+        build_parser().error("缺少地址（网页或 m3u8 都行；或用 --selftest 只跑自检）")
     _selftest_aes()
+
+    save_dir = os.path.abspath(os.path.expanduser(args.save_dir or "."))
+    cache_root = os.path.abspath(os.path.expanduser(args.cache_dir)) if args.cache_dir else save_dir
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(cache_root, exist_ok=True)
+    except OSError as e:
+        print(f"保存/缓存目录建不了：{e}", file=sys.stderr)
+        return 1
 
     dl = Downloader(args)
     try:
-        pl, base = dl.load_playlist(args.target)
+        target = args.target
+        pl = None
+        base = target
+        page_title = ""
+        is_http = bool(re.match(r"^https?://", target, re.I))
+        need_browser = is_http and not args.no_browser and ".m3u8" not in target.lower()
+
+        if need_browser:
+            print("→ 网页地址：启动无头浏览器自动找 m3u8…")
+            urls, page_title, hdr = resolve_media_urls(
+                target,
+                browser=args.browser,
+                headless=not args.no_headless,
+                wait=args.wait,
+                user_agent=args.user_agent,
+                extra_clicks=args.click,
+                verbose=args.verbose,
+            )
+            for u in urls[:6]:
+                print(f"   捕获：{u}")
+            if len(urls) > 6:
+                print(f"   …共 {len(urls)} 个 m3u8")
+            if page_title:
+                print(f"→ 网页标题：{page_title}")
+            if hdr:
+                dl.session.headers.update(hdr)
+            pl, base = pick_playlist(urls, hdr, args)
+        else:
+            pl, base = dl.load_playlist(target)
+
         if args.list_formats:
             if pl.is_master:
                 variants = sorted([(u, b) for u, b in pl.variants if u], key=lambda x: -x[1])
@@ -664,18 +878,34 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 print("这不是 master playlist（只有一条媒体流）")
             return 0
+
         if args.dry_run:
-            pl, base = dl.choose_variant(base, pl)
-            print(f"分片数：{len(pl.segments)}")
-            print(f"加密：{'是' if any(s.key and s.key.method != 'NONE' for s in pl.segments) else '否'}")
-            for s in pl.segments[:5]:
+            pl2, base2 = dl.choose_variant(base, pl)
+            enc = any(s.key and s.key.method != "NONE" for s in pl2.segments)
+            print(f"分片数：{len(pl2.segments)}")
+            print(f"加密：{'是' if enc else '否'}")
+            for s in pl2.segments[:5]:
                 print("  " + s.url)
-            if len(pl.segments) > 5:
-                print(f"  …（还有 {len(pl.segments) - 5} 个）")
+            if len(pl2.segments) > 5:
+                print(f"  …（还有 {len(pl2.segments) - 5} 个）")
             return 0
-        out = args.output or default_output(args.target, base)
-        print(f"→ 输出：{os.path.abspath(out)}")
-        return dl.run(args.target, out)
+
+        # 名字：网页标题优先，其次地址里的文件名
+        name = _safe_name(page_title, name_from_target(target))
+        if args.output:
+            out = args.output if os.path.isabs(args.output) else os.path.join(save_dir, args.output)
+        else:
+            out = build_output_path(save_dir, name)
+        if args.cache_dir:
+            # 指定了缓存目录：缓存集中放那儿，按视频名建子目录
+            parts_dir = os.path.join(cache_root, os.path.splitext(os.path.basename(out))[0] + ".parts")
+        else:
+            # 没指定：缓存跟输出文件放一起（<文件名>.parts），和以前一样
+            parts_dir = out + ".parts"
+
+        print(f"→ 保存到：{os.path.abspath(out)}")
+        print(f"→ 缓存到：{os.path.abspath(parts_dir)}")
+        return dl.run(target, out, parts_dir=parts_dir, playlist=pl, base_url=base)
     except KeyboardInterrupt:
         print("\n已取消")
         return 130

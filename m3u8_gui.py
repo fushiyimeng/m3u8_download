@@ -2,12 +2,10 @@
 # -*- coding: utf-8 -*-
 """m3u8 下载器 · Qt 图形界面（PyQt5）
 
-界面只收集参数，真正下载由 m3u8_download.py 完成（QProcess 子进程），
-所以 GUI 和命令行行为完全一致，下载器崩了也不会带崩界面。
-
-启动：
-    python m3u8_gui.py          # 带控制台
-    pythonw m3u8_gui.py         # 不带控制台（双击 .py 关联也行）
+- 地址可以填网页（自动用无头浏览器找 m3u8），也可以填 m3u8 直链、本地文件
+- 保存目录 / 缓存目录 / 浏览器 / 等待时间 都在「设置」里选，记在注册表里（QSettings）
+- 文件名默认用网页标题（获取到什么就用什么），也可以在「保存名」里自己改
+- 真正干活的是 m3u8_download.py（QProcess 子进程），所以 GUI 和命令行行为一致
 """
 from __future__ import annotations
 
@@ -15,13 +13,15 @@ import os
 import re
 import sys
 
-from PyQt5.QtCore import QProcess, Qt, QProcessEnvironment
+from PyQt5.QtCore import QProcess, QProcessEnvironment, QSettings, Qt
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -39,22 +39,165 @@ CORE = os.path.join(HERE, "m3u8_download.py")
 PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
-def default_out(url: str) -> str:
-    """根据地址猜一个输出文件名（和命令行版规则一致）。"""
-    name = url.rstrip("/").split("/")[-1] or "video.m3u8"
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    stem, _ = os.path.splitext(name)
-    return os.path.splitext(os.path.abspath(CORE))[0] and os.path.join(os.getcwd(), (stem or "video") + ".mp4")
+def default_save_dir() -> str:
+    for cand in (os.path.join(os.path.expanduser("~"), "Downloads"),
+                 os.path.join(os.path.expanduser("~"), "下载")):
+        if os.path.isdir(cand):
+            return cand
+    return HERE
+
+
+class Settings:
+    """简单封装 QSettings：保存目录、缓存目录、浏览器等。"""
+
+    def __init__(self):
+        self.s = QSettings("fushiyimeng", "m3u8-downloader")
+
+    def get(self, key: str, default):
+        v = self.s.value(key, default)
+        if isinstance(default, bool):
+            if isinstance(v, bool):
+                return v
+            return str(v).lower() in ("true", "1", "yes")
+        if isinstance(default, int):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+        if isinstance(default, float):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+        return str(v) if v is not None else default
+
+    def set(self, key: str, value):
+        self.s.setValue(key, value)
+
+    @property
+    def save_dir(self) -> str:
+        d = self.get("save_dir", "")
+        return d if d and os.path.isdir(d) else default_save_dir()
+
+    @save_dir.setter
+    def save_dir(self, v: str):
+        self.set("save_dir", v)
+
+    @property
+    def cache_dir(self) -> str:
+        return self.get("cache_dir", "")
+
+    @cache_dir.setter
+    def cache_dir(self, v: str):
+        self.set("cache_dir", v)
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, st: Settings, parent=None):
+        super().__init__(parent)
+        self.st = st
+        self.setWindowTitle("设置")
+        self.setMinimumWidth(580)
+        form = QFormLayout(self)
+
+        row = QHBoxLayout()
+        self.save_dir = QLineEdit(st.save_dir)
+        row.addWidget(self.save_dir, 1)
+        b = QPushButton("浏览…")
+        b.clicked.connect(lambda: self.pick_dir(self.save_dir))
+        row.addWidget(b)
+        form.addRow("保存目录", self._wrap(row))
+
+        row = QHBoxLayout()
+        self.cache_dir = QLineEdit(st.cache_dir)
+        self.cache_dir.setPlaceholderText("留空 = 放在保存目录下的「视频名.parts」")
+        row.addWidget(self.cache_dir, 1)
+        b = QPushButton("浏览…")
+        b.clicked.connect(lambda: self.pick_dir(self.cache_dir))
+        row.addWidget(b)
+        form.addRow("缓存目录", self._wrap(row))
+
+        self.browser = QLineEdit(st.get("browser", "msedge"))
+        self.browser.setPlaceholderText("msedge / chrome / chromium（用系统自带的，不用下内核）")
+        form.addRow("浏览器", self.browser)
+
+        self.show_browser = QCheckBox("显示浏览器窗口（默认无头；勾上会弹出来，排查页面卡住处用）")
+        self.show_browser.setChecked(st.get("show_browser", False))
+        form.addRow("", self.show_browser)
+
+        self.wait = QSpinBox()
+        self.wait.setRange(5, 180)
+        self.wait.setSuffix(" 秒")
+        self.wait.setValue(st.get("wait", 25))
+        form.addRow("等页面出 m3u8", self.wait)
+
+        row = QHBoxLayout()
+        self.workers = QSpinBox()
+        self.workers.setRange(1, 32)
+        self.workers.setValue(st.get("workers", 8))
+        self.retries = QSpinBox()
+        self.retries.setRange(0, 10)
+        self.retries.setValue(st.get("retries", 3))
+        row.addWidget(QLabel("并发"))
+        row.addWidget(self.workers)
+        row.addSpacing(14)
+        row.addWidget(QLabel("重试"))
+        row.addWidget(self.retries)
+        row.addStretch(1)
+        form.addRow("下载", self._wrap(row))
+
+        row2 = QHBoxLayout()
+        self.ffmpeg = QLineEdit(st.get("ffmpeg", ""))
+        self.ffmpeg.setPlaceholderText("留空自动找 PATH / 同目录")
+        row2.addWidget(self.ffmpeg, 1)
+        bb = QPushButton("浏览…")
+        bb.clicked.connect(self.pick_ffmpeg)
+        row2.addWidget(bb)
+        form.addRow("ffmpeg", self._wrap(row2))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(layout)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return w
+
+    def pick_dir(self, target: QLineEdit):
+        d = QFileDialog.getExistingDirectory(self, "选择目录", target.text() or os.path.expanduser("~"))
+        if d:
+            target.setText(d)
+
+    def pick_ffmpeg(self):
+        p, _ = QFileDialog.getOpenFileName(self, "选择 ffmpeg", "", "ffmpeg (ffmpeg.exe);;所有文件 (*.*)")
+        if p:
+            self.ffmpeg.setText(p)
+
+    def save(self):
+        self.st.save_dir = self.save_dir.text().strip()
+        self.st.cache_dir = self.cache_dir.text().strip()
+        self.st.set("browser", self.browser.text().strip() or "msedge")
+        self.st.set("show_browser", self.show_browser.isChecked())
+        self.st.set("wait", self.wait.value())
+        self.st.set("workers", self.workers.value())
+        self.st.set("retries", self.retries.value())
+        self.st.set("ffmpeg", self.ffmpeg.text().strip())
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
+        self.st = Settings()
         self.proc: QProcess | None = None
         self.buf = ""
         self.setWindowTitle("m3u8 下载器 · Qt")
-        # 和 2021 年那版 pygame 窗口保持一致：800x600
-        self.setFixedSize(800, 600)
+        self.setFixedSize(800, 600)      # 和原来 pygame 版一致
         self.build_ui()
 
     # ── 界面 ──────────────────────────────────────────────
@@ -70,62 +213,31 @@ class MainWindow(QWidget):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
 
-        # 地址
         row = QHBoxLayout()
-        row.addWidget(self._field_label("m3u8 地址："))
+        row.addWidget(self._field_label("地址："))
         self.url = QLineEdit()
-        self.url.setPlaceholderText("https://example.com/video/index.m3u8  （也可以选本地文件）")
+        self.url.setPlaceholderText("网页地址或 m3u8 直链都行 —— 网页会自动用浏览器找 m3u8")
         row.addWidget(self.url, 1)
         btn_local = QPushButton("本地文件…")
         btn_local.clicked.connect(self.pick_local)
         row.addWidget(btn_local)
         root.addLayout(row)
 
-        # 保存位置
         row = QHBoxLayout()
-        row.addWidget(self._field_label("保存为："))
-        self.out = QLineEdit()
-        self.out.setPlaceholderText("留空 = 自动放在当前目录")
-        row.addWidget(self.out, 1)
-        btn_out = QPushButton("浏览…")
-        btn_out.clicked.connect(self.pick_out)
-        row.addWidget(btn_out)
+        row.addWidget(self._field_label("保存名："))
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("留空 = 自动用网页标题")
+        row.addWidget(self.name, 1)
+        btn_set = QPushButton("设置…")
+        btn_set.clicked.connect(self.open_settings)
+        row.addWidget(btn_set)
         root.addLayout(row)
 
-        # 高级参数
-        box = QGroupBox("可选（防盗链站点才需要）")
-        form = QFormLayout(box)
-        self.referer = QLineEdit()
-        self.referer.setPlaceholderText("https://example.com/")
-        form.addRow("Referer", self.referer)
-        self.cookie = QLineEdit()
-        self.cookie.setPlaceholderText("token=abc; uid=123")
-        form.addRow("Cookie", self.cookie)
-        self.ua = QLineEdit()
-        self.ua.setPlaceholderText("留空用默认浏览器 UA")
-        form.addRow("User-Agent", self.ua)
+        self.hint = QLabel()
+        self.hint.setStyleSheet("color:#666;font-size:12px")
+        root.addWidget(self.hint)
+        self.refresh_hint()
 
-        row = QHBoxLayout()
-        self.workers = QSpinBox()
-        self.workers.setRange(1, 32)
-        self.workers.setValue(8)
-        self.retries = QSpinBox()
-        self.retries.setRange(0, 10)
-        self.retries.setValue(3)
-        self.ffmpeg = QLineEdit()
-        self.ffmpeg.setPlaceholderText("留空自动找 PATH / 同目录")
-        row.addWidget(QLabel("并发"))
-        row.addWidget(self.workers)
-        row.addSpacing(12)
-        row.addWidget(QLabel("重试"))
-        row.addWidget(self.retries)
-        row.addSpacing(12)
-        row.addWidget(QLabel("ffmpeg"))
-        row.addWidget(self.ffmpeg, 1)
-        form.addRow(row)
-        root.addWidget(box)
-
-        # 按钮
         row = QHBoxLayout()
         self.btn_go = QPushButton("开始下载")
         self.btn_go.setDefault(True)
@@ -144,19 +256,27 @@ class MainWindow(QWidget):
         row.addWidget(self.status, 1)
         root.addLayout(row)
 
-        # 进度
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
-        self.bar.setTextVisible(True)
         root.addWidget(self.bar)
 
-        # 日志
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Consolas", 9))
         self.log.setMaximumBlockCount(5000)
         root.addWidget(self.log, 1)
+
+    def refresh_hint(self):
+        cache = self.st.cache_dir or "（同上目录下的 .parts）"
+        self.hint.setText(f"保存到：{self.st.save_dir}    缓存：{cache}")
+
+    def open_settings(self):
+        dlg = SettingsDialog(self.st, self)
+        if dlg.exec_() == QDialog.Accepted:
+            dlg.save()
+            self.refresh_hint()
+            self.write("设置已保存")
 
     # ── 交互 ──────────────────────────────────────────────
     def pick_local(self):
@@ -164,18 +284,11 @@ class MainWindow(QWidget):
                                               "m3u8 播放列表 (*.m3u8);;所有文件 (*.*)")
         if path:
             self.url.setText(path)
-            if not self.out.text().strip():
-                self.out.setText(os.path.splitext(path)[0] + ".mp4")
-
-    def pick_out(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存为", self.out.text() or "",
-                                              "MP4 视频 (*.mp4);;所有文件 (*.*)")
-        if path:
-            self.out.setText(path)
+            if not self.name.text().strip():
+                self.name.setText(os.path.splitext(os.path.basename(path))[0])
 
     def reveal(self):
-        target = self.out.text().strip()
-        d = os.path.dirname(os.path.abspath(target)) if target else os.getcwd()
+        d = self.st.save_dir
         if os.path.isdir(d):
             if hasattr(os, "startfile"):
                 os.startfile(d)  # type: ignore[attr-defined]
@@ -195,25 +308,29 @@ class MainWindow(QWidget):
 
     # ── 运行 ──────────────────────────────────────────────
     def build_command(self) -> list[str]:
-        url = self.url.text().strip()
-        cmd = [sys.executable, CORE, url]
-        if self.out.text().strip():
-            cmd += ["-o", self.out.text().strip()]
-        if self.referer.text().strip():
-            cmd += ["--referer", self.referer.text().strip()]
-        if self.cookie.text().strip():
-            cmd += ["--cookie", self.cookie.text().strip()]
-        if self.ua.text().strip():
-            cmd += ["--user-agent", self.ua.text().strip()]
-        cmd += ["--workers", str(self.workers.value()), "--retries", str(self.retries.value())]
-        if self.ffmpeg.text().strip():
-            cmd += ["--ffmpeg", self.ffmpeg.text().strip()]
+        cmd = [sys.executable, CORE, self.url.text().strip()]
+        cmd += ["--save-dir", self.st.save_dir]
+        if self.st.cache_dir:
+            cmd += ["--cache-dir", self.st.cache_dir]
+        cmd += ["--browser", self.st.get("browser", "msedge")]
+        if self.st.get("show_browser", False):
+            cmd += ["--no-headless"]
+        cmd += ["--wait", str(self.st.get("wait", 25))]
+        cmd += ["--workers", str(self.st.get("workers", 8))]
+        cmd += ["--retries", str(self.st.get("retries", 3))]
+        ff = self.st.get("ffmpeg", "")
+        if ff:
+            cmd += ["--ffmpeg", ff]
+        name = self.name.text().strip()
+        if name:
+            if not name.lower().endswith(".mp4"):
+                name += ".mp4"
+            cmd += ["-o", name]
         return cmd
 
     def start(self):
-        url = self.url.text().strip()
-        if not url:
-            QMessageBox.warning(self, "缺少地址", "先填一个 m3u8 地址，或点「本地文件…」选一个")
+        if not self.url.text().strip():
+            QMessageBox.warning(self, "缺少地址", "先填一个网页地址或 m3u8 地址，或点「本地文件…」")
             return
         cmd = self.build_command()
         self.log.clear()
@@ -250,13 +367,13 @@ class MainWindow(QWidget):
     def on_error(self, err):
         if err == QProcess.FailedToStart:
             self.write("启动失败：找不到 Python？")
-            self.reset(False)
+            self.reset()
 
     def on_finished(self, code: int, _status):
         if self.buf.strip():
             self.write(self.buf.strip())
             self.buf = ""
-        self.reset(code == 0)
+        self.reset()
         if code == 0:
             self.bar.setValue(100)
             self.status.setText("完成")
@@ -270,11 +387,9 @@ class MainWindow(QWidget):
             self.proc.terminate()
             self.write("\n已请求停止（已下载的分片会保留，下次接着下）")
 
-    def reset(self, ok: bool):
+    def reset(self):
         self.btn_go.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        if ok:
-            self.proc = None
 
 
 def main() -> int:
